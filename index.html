@@ -1,0 +1,391 @@
+const tg = window.Telegram?.WebApp;
+
+if (tg) {
+    tg.ready();
+    tg.expand();
+    tg.setHeaderColor('#1d2a19');
+    tg.setBackgroundColor('#111a10');
+    tg.disableVerticalSwipes?.();
+}
+
+// ============================
+// ИГРОК ИЗ TELEGRAM
+// ============================
+const tgUser = tg?.initDataUnsafe?.user || null;
+
+const player = {
+    id: tgUser?.id || 'guest_' + (localStorage.getItem('gnomely_guest_id') 
+        || (() => { const id = Math.random().toString(36).slice(2); 
+             localStorage.setItem('gnomely_guest_id', id); return id; })()),
+    name: tgUser ? [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') 
+                 || tgUser.username || 'Игрок' 
+                 : 'Гость',
+    avatar: tgUser?.photo_url || null,
+    username: tgUser?.username || null
+};
+
+// ============================
+// СОСТОЯНИЕ ИГРЫ
+// ============================
+const SAVE_KEY = 'gnomely_save_v1';
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const DEFAULT_STATE = {
+    coins: 0,
+    hunger: 75,
+    mood: 82,
+    energy: 64,
+    clean: 91,
+    lastUpdate: Date.now(),
+    lastDailyReset: Date.now(),
+    careCount: 0,          // действий за сегодня
+    totalCare: 0,          // всего действий
+    streak: 0,             // дней подряд
+    inventory: [],         // купленные предметы
+    ownedSkins: []         // купленная косметика
+};
+
+let state = { ...DEFAULT_STATE };
+
+// ============================
+// ЗАГРУЗКА / СОХРАНЕНИЕ
+// ============================
+function loadState() {
+    try {
+        const raw = localStorage.getItem(SAVE_KEY);
+        if (!raw) return false;
+        const saved = JSON.parse(raw);
+        state = { ...DEFAULT_STATE, ...saved };
+        return true;
+    } catch (e) {
+        console.warn('Не удалось загрузить сохранение', e);
+        return false;
+    }
+}
+
+function saveState() {
+    state.lastUpdate = Date.now();
+    try {
+        localStorage.setItem(SAVE_KEY, JSON.stringify(state));
+    } catch (e) {
+        console.warn('Не удалось сохранить', e);
+    }
+    // Параллельно в Telegram Cloud Storage (если есть)
+    if (tg?.CloudStorage) {
+        tg.CloudStorage.setItem(SAVE_KEY, JSON.stringify(state), (err) => {
+            if (err) console.warn('CloudStorage error', err);
+        });
+    }
+}
+
+// Загрузка из Cloud Storage при старте (приоритетнее localStorage)
+async function loadFromCloud() {
+    if (!tg?.CloudStorage) return;
+    return new Promise((resolve) => {
+        tg.CloudStorage.getItem(SAVE_KEY, (err, value) => {
+            if (err || !value) return resolve(false);
+            try {
+                const saved = JSON.parse(value);
+                if (saved.lastUpdate && saved.lastUpdate > (state.lastUpdate || 0)) {
+                    state = { ...DEFAULT_STATE, ...saved };
+                    resolve(true);
+                } else resolve(false);
+            } catch { resolve(false); }
+        });
+    });
+}
+
+// ============================
+// УСТАЛОСТЬ СО ВРЕМЕНЕМ
+// ============================
+// За 1 час: сытость -3, настроение -2, энергия -1, чистота -2
+// (т.е. за сутки примерно -72/-48/-24/-48 — игра требует внимания)
+const DECAY_PER_MS = {
+    hunger: -3 / (60 * 60 * 1000),
+    mood:   -2 / (60 * 60 * 1000),
+    energy: -1 / (60 * 60 * 1000),
+    clean:  -2 / (60 * 60 * 1000)
+};
+
+function applyDecay() {
+    const now = Date.now();
+    const dt = now - (state.lastUpdate || now);
+    if (dt <= 0 || dt > DAY_MS * 30) { 
+        state.lastUpdate = now; 
+        return; 
+    }
+    
+    ['hunger', 'mood', 'energy', 'clean'].forEach(k => {
+        state[k] = clamp(state[k] + DECAY_PER_MS[k] * dt);
+    });
+    state.lastUpdate = now;
+}
+
+function clamp(v) { return Math.max(0, Math.min(100, Math.round(v))); }
+
+// ============================
+// ЕЖЕДНЕВНЫЙ СБРОС (счётчик заботы)
+// ============================
+function checkDailyReset() {
+    const now = Date.now();
+    const since = now - (state.lastDailyReset || now);
+    if (since >= DAY_MS) {
+        // Был ли полный пропуск дня? Проверяем стрик
+        const daysPassed = Math.floor(since / DAY_MS);
+        if (daysPassed === 1 && state.careCount >= 4) {
+            state.streak += 1;
+        } else {
+            state.streak = 0;
+        }
+        state.careCount = 0;
+        state.lastDailyReset = now;
+    }
+}
+
+// ============================
+// ОБНОВЛЕНИЕ UI
+// ============================
+function updateUI() {
+    document.getElementById("coinBalance").textContent = state.coins;
+
+    const stats = [
+        ["hunger", "hungerText", state.hunger],
+        ["mood", "moodText", state.mood],
+        ["energy", "energyText", state.energy],
+        ["clean", "cleanText", state.clean]
+    ];
+
+    stats.forEach(([bar, text, value]) => {
+        document.getElementById(bar).style.width = value + "%";
+        document.getElementById(text).textContent = value;
+    });
+
+    // Обновим имя игрока в рейтинге (если хотим показать себя)
+    const nameEl = document.getElementById("playerName");
+    if (nameEl) nameEl.textContent = player.name;
+}
+
+// ============================
+// ДЕЙСТВИЯ УХОДА
+// ============================
+const DAILY_LIMIT = 12; // не больше 12 действий в день (антиспам)
+
+function care(type) {
+    checkDailyReset();
+
+    if (state.careCount >= DAILY_LIMIT) {
+        tg?.showAlert ? tg.showAlert(`Дневной лимит исчерпан (${DAILY_LIMIT}). Возвращайся завтра!`) 
+                      : alert(`Дневной лимит исчерпан (${DAILY_LIMIT}).`);
+        return;
+    }
+
+    let reward = 0;
+
+    if (type === "feed") {
+        state.hunger = clamp(state.hunger + 15);
+        state.mood = clamp(state.mood + 3);
+        reward = 10;
+    }
+    if (type === "play") {
+        if (state.energy < 10) {
+            notify("Гном слишком устал для игр 😴");
+            return;
+        }
+        state.mood = clamp(state.mood + 12);
+        state.energy = clamp(state.energy - 5);
+        state.hunger = clamp(state.hunger - 3);
+        reward = 8;
+    }
+    if (type === "wash") {
+        state.clean = clamp(state.clean + 20);
+        state.mood = clamp(state.mood - 2); // не всем нравится мыться
+        reward = 8;
+    }
+    if (type === "sleep") {
+        state.energy = clamp(state.energy + 20);
+        state.hunger = clamp(state.hunger - 2);
+        reward = 7;
+    }
+
+    state.coins += reward;
+    state.careCount += 1;
+    state.totalCare += 1;
+
+    saveState();
+    updateUI();
+}
+
+function notify(msg) {
+    if (tg?.showAlert) tg.showAlert(msg);
+    else alert(msg);
+}
+
+// ============================
+// МАГАЗИН
+// ============================
+function buyCoins(price, itemId, effect) {
+    if (state.coins < price) {
+        notify("Не хватает 🪙");
+        return;
+    }
+    state.coins -= price;
+
+    // Применяем эффект
+    if (effect === "food15") state.hunger = clamp(state.hunger + 15);
+    if (effect === "food25") state.hunger = clamp(state.hunger + 25);
+    if (effect === "energy30") state.energy = clamp(state.energy + 30);
+    if (effect === "mood20") state.mood = clamp(state.mood + 20);
+    if (itemId) state.inventory.push(itemId);
+
+    saveState();
+    updateUI();
+    notify("Куплено!");
+}
+
+function buyStars(price, itemId) {
+    // Заглушка: в реальном приложении — вызов tg.openInvoice()
+    if (tg?.openInvoice) {
+        // здесь был бы createInvoiceLink с сервера
+        notify(`Оплата ${price} ⭐ — подключим после настройки бота.`);
+    } else {
+        notify(`Здесь будет оплата ${price} ⭐`);
+    }
+}
+
+// ============================
+// РЕЙТИНГ (с локальным fallback)
+// ============================
+async function loadLeaderboard() {
+    const box = document.getElementById("leaderboard");
+    box.innerHTML = '<div class="loading">Загрузка рейтинга...</div>';
+
+    let players = null;
+
+    // 1) Пытаемся с сервера
+    try {
+        const resp = await fetch("/api/leaderboard", {
+            headers: { "X-Telegram-Init-Data": tg?.initData || "" }
+        });
+        if (resp.ok) {
+            const data = await resp.json();
+            if (Array.isArray(data) && data.length) players = data;
+        }
+    } catch (_) { /* сервер недоступен — идём в fallback */ }
+
+    // 2) Локальный fallback: показываем себя + ботов (заглушка)
+    if (!players) {
+        players = buildLocalLeaderboard();
+    }
+
+    renderLeaderboard(players);
+}
+
+function buildLocalLeaderboard() {
+    // Себя вставляем реально, остальных — демо (пока нет сервера)
+    const me = {
+        name: player.name,
+        avatar: player.avatar || "🧙",
+        score: state.coins + state.totalCare * 5,
+        isMe: true
+    };
+    const demo = [
+        { name: "Гримли", avatar: "🧔", score: 2480 },
+        { name: "Моховик", avatar: "🌿", score: 2110 },
+        { name: "Тыквоголовый", avatar: "🎃", score: 1875 },
+        { name: "Бородач II", avatar: "🍄", score: 1620 },
+        { name: "Лесной дух", avatar: "🌲", score: 1400 },
+        { name: "Каменюка", avatar: "🪨", score: 1230 },
+        { name: "Мшистый", avatar: "🍀", score: 990 },
+        { name: "Гном-новичок", avatar: "👶", score: 720 },
+        { name: "Старый Пень", avatar: "🪵", score: 510 }
+    ];
+    return [...demo, me]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 10);
+}
+
+function renderLeaderboard(players) {
+    const box = document.getElementById("leaderboard");
+    box.innerHTML = "";
+
+    players.slice(0, 10).forEach((p, index) => {
+        const row = document.createElement("div");
+        row.className = "top-player";
+        if (p.isMe) row.style.borderColor = "#d6ad48";
+
+        const medal = index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : index + 1;
+
+        row.innerHTML = `
+            <div class="place">${medal}</div>
+            <div class="avatar">${p.avatar && p.avatar.startsWith("http") 
+                ? `<img src="${escapeHTML(p.avatar)}" style="width:100%;height:100%;border-radius:50%;object-fit:cover">`
+                : (p.avatar || "🧙")}</div>
+            <div class="top-info">
+                <div class="top-name">${escapeHTML(p.name)}${p.isMe ? " (вы)" : ""}</div>
+                <div class="top-score">${Number(p.score).toLocaleString("ru-RU")} очков</div>
+            </div>
+            ${index < 10 ? '<div class="exclusive">🎁 TOP 10</div>' : ""}
+        `;
+        box.appendChild(row);
+    });
+
+    if (!players.length) {
+        box.innerHTML = '<div class="error">Рейтинг пока пуст.</div>';
+    }
+}
+
+// ============================
+// НАВИГАЦИЯ
+// ============================
+function showPage(page, button) {
+    document.querySelectorAll(".page").forEach(x => x.classList.remove("active"));
+    document.getElementById(page).classList.add("active");
+
+    document.querySelectorAll(".nav button").forEach(x => x.classList.remove("active"));
+    button.classList.add("active");
+
+    if (page === "top") loadLeaderboard();
+}
+
+// ============================
+// АНИМАЦИЯ (гном "дышит", реагирует)
+// ============================
+function animateGnome() {
+    const gnome = document.querySelector(".gnome");
+    if (!gnome) return;
+    const mood = state.mood;
+    const speed = mood > 70 ? 2 : mood > 40 ? 3 : 5; // грустный — медленнее
+    gnome.style.transition = "transform 0.6s ease-in-out";
+    let t = 0;
+    setInterval(() => {
+        t += 0.1;
+        const y = Math.sin(t) * 1.5;
+        gnome.style.transform = `translateY(${y}px)`;
+    }, speed * 100);
+}
+
+// ============================
+// СТАРТ
+// ============================
+async function init() {
+    loadState();               // 1. localStorage
+    await loadFromCloud();     // 2. Cloud Storage (если новее)
+    applyDecay();              // 3. усталость
+    checkDailyReset();         // 4. дневной сброс
+    updateUI();
+    animateGnome();
+
+    // Автосохранение каждые 30 секунд
+    setInterval(() => {
+        applyDecay();
+        updateUI();
+        saveState();
+    }, 30000);
+
+    // Сохраняем при закрытии
+    window.addEventListener("beforeunload", saveState);
+
+    console.log("Игрок:", player);
+}
+
+init();
